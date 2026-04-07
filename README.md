@@ -7,7 +7,16 @@ A local, offline CSV analyzer powered by [Ollama](https://ollama.com) and Phi-3 
 - **Structure view** — column names, data types, null counts, and sample values
 - **Data preview** — random sample of up to 5 rows
 - **AI summary** — one-click summary of what the dataset contains and notable patterns
-- **Q&A** — ask any question about the data in plain English
+- **Q&A** — ask questions in plain English; answered via SQL execution or LLM fallback
+
+## How Q&A Works
+
+Questions are answered using a two-step pipeline for accuracy:
+
+1. **SQL path** — the LLM generates a DuckDB SQL query, validated and repaired by [sqlglot](https://github.com/tobymao/sqlglot) before execution. Results are exact and deterministic.
+2. **Fallback path** — if the question can't be expressed as SQL (e.g. "what patterns do you see?"), it falls back to LLM-over-data with streaming output.
+
+A debug panel on each response shows which path was taken, the raw LLM output, and any SQL repairs applied.
 
 ## Choosing a Model
 
@@ -32,7 +41,7 @@ A range of Gemma, Qwen, and Phi models are available. As a rule of thumb, you ne
 
 > **Note:** Gemini and Claude are cloud-based models and require API keys. All others run fully offline via Ollama.
 
-To swap models, update the `model=` value in `app.py` and pull the model:
+To swap models, update the `MODEL` constant at the top of `app.py` and pull the model:
 
 ```bash
 ollama pull gemma3:4b   # example
@@ -47,7 +56,7 @@ ollama pull gemma3:4b   # example
 
 ```bash
 # Install dependencies
-pip install streamlit pandas ollama
+pip install streamlit pandas ollama duckdb sqlglot
 
 # Pull a model (example — pick one from the table above)
 ollama pull phi3:mini
@@ -63,4 +72,4 @@ Then open [http://localhost:8501](http://localhost:8501) in your browser.
 1. Upload a `.csv` file using the file uploader
 2. Review the structure and preview tables
 3. Click **Summarize CSV** for an AI-generated overview
-4. Type a question in the text box to query the data
+4. Type a question — the app will execute SQL where possible, fall back to LLM otherwise
