@@ -1,28 +1,34 @@
 # ask-my-csv
 
-A local, offline CSV analyzer powered by [Ollama](https://ollama.com) and Phi-3 Mini. Upload any CSV file to explore its structure, generate an AI summary, and ask natural language questions about your data — no API keys required.
+A local, offline CSV analyzer powered by [Ollama](https://ollama.com) and Phi-3 Mini. Upload any CSV file, ask questions in plain English, and get accurate answers — no API keys, no internet required.
 
 ## Features
 
 - **Structure view** — column names, data types, null counts, and sample values
-- **Data preview** — random sample of up to 5 rows
-- **AI summary** — one-click summary of what the dataset contains and notable patterns
-- **Q&A** — ask questions in plain English; answered via SQL execution or LLM fallback
+- **Data preview** — random sample of rows on load
+- **Q&A** — ask anything about your data; answered via pandas execution or LLM text fallback
 
 ## How Q&A Works
 
-Questions are answered using a two-step pipeline for accuracy:
+Questions are answered using a two-layer pipeline:
 
-1. **SQL path** — the LLM generates a DuckDB SQL query, validated and repaired by [sqlglot](https://github.com/tobymao/sqlglot) before execution. Results are exact and deterministic.
-2. **Fallback path** — if the question can't be expressed as SQL (e.g. "what patterns do you see?"), it falls back to LLM-over-data with streaming output.
+### Layer 1 — LLM → Pandas (data questions)
+For questions that can be answered by querying the data ("average revenue by company", "top 5 customers last 3 months", "show acme corp revenue over time"), the LLM generates a pandas expression which is executed directly against the DataFrame.
 
-A debug panel on each response shows which path was taken, the raw LLM output, and any SQL repairs applied.
+- No SQL dialect issues — pandas handles mixed types natively
+- Up to 3 attempts: initial generation + one LLM repair if execution fails
+- Each attempt is shown as an iteration with the expression and any error
+
+### Layer 2 — LLM text answer (analytical questions)
+If the LLM signals the question can't be answered by querying data (e.g. "what are the risks for unity partners?", "explain the trend"), it falls straight through to a text answer using relevant rows from the dataset as context.
+
+A `NO_PANDAS` escape hatch prevents the LLM from forcing analytical questions into code.
 
 ## Choosing a Model
 
-This app runs **fully offline** using [Ollama](https://ollama.com) — no API keys, no internet required. Pick a model based on your machine's available RAM.
+This app runs **fully offline** using [Ollama](https://ollama.com). Pick a model based on your machine's available RAM.
 
-A range of Gemma, Qwen, and Phi models are available. As a rule of thumb, you need roughly 1.5–2× the model's parameter size in free RAM (e.g. a 4B model needs ~6–8GB).
+As a rule of thumb, you need roughly 1.5–2× the model's parameter size in free RAM (e.g. a 4B model needs ~6–8GB).
 
 ### Quick Comparison
 
@@ -56,7 +62,7 @@ ollama pull gemma3:4b   # example
 
 ```bash
 # Install dependencies
-pip install streamlit pandas ollama duckdb sqlglot
+pip install streamlit pandas ollama chardet
 
 # Pull a model (example — pick one from the table above)
 ollama pull phi3:mini
@@ -69,7 +75,6 @@ Then open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ## Usage
 
-1. Upload a `.csv` file using the file uploader
-2. Review the structure and preview tables
-3. Click **Summarize CSV** for an AI-generated overview
-4. Type a question — the app will execute SQL where possible, fall back to LLM otherwise
+1. Upload a `.csv` file
+2. Review the data preview
+3. Type a question — data questions execute as pandas, analytical questions get a text answer
