@@ -1,222 +1,245 @@
 import streamlit as st
 import pandas as pd
 import ollama
-import duckdb
 import re
-import sqlglot
-import sqlglot.expressions as exp
+import chardet
 
 MODEL = "phi3:mini"
-DIALECT = "duckdb"
-STAT_KEYWORDS = {"average", "mean", "max", "min", "sum", "count", "median", "std", "total"}
-MAX_HISTORY = 50
 
-_SQL_PATTERNS = [
-    re.compile(r"```(?:sql)?\s*(SELECT[\s\S]+?)```", re.IGNORECASE),
-    re.compile(r"(SELECT[\s\S]+?;)", re.IGNORECASE),
-    re.compile(r"(SELECT[\s\S]+)", re.IGNORECASE),
-]
+# -------------------------------
+# INGESTION
+# -------------------------------
 
-st.set_page_config(page_title="CSV Analyzer", layout="wide")
-st.title("📊 CSV Analyzer with Phi-3 Mini")
+def detect_encoding(file):
+    raw = file.read(100000)
+    file.seek(0)
+    return chardet.detect(raw)["encoding"]
+
+def robust_read_csv(file):
+    enc = detect_encoding(file) or "utf-8"
+    for e in [enc, "utf-8", "cp1252", "latin1"]:
+        try:
+            df = pd.read_csv(file, encoding=e)
+            file.seek(0)
+            return df
+        except Exception:
+            file.seek(0)
+    raise ValueError("CSV load failed")
+
+def profile_columns(df):
+    profile = {}
+    for col in df.columns:
+        s = df[col]
+        is_object = s.dtype == object
+        cleaned = s.str.replace(r"[\$,£€%,\s]", "", regex=True).str.strip() if is_object else s
+        profile[col] = {
+            "numeric_pct": pd.to_numeric(cleaned, errors="coerce").notna().mean(),
+            "date_pct": pd.to_datetime(s, errors="coerce").notna().mean() if is_object else 0.0,
+        }
+    return profile
+
+def apply_types(df, profile):
+    for col, meta in profile.items():
+        if df[col].dtype != object:
+            continue
+        cleaned = df[col].str.replace(r"[\$,£€%,\s]", "", regex=True).str.strip()
+        if meta["numeric_pct"] > 0.8:
+            df[col] = pd.to_numeric(cleaned, errors="coerce")
+        elif meta["date_pct"] > 0.8:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
 
 @st.cache_data
-def load_data(file):
-    df = pd.read_csv(file)
-    for col in df.select_dtypes(include="object").columns:
-        cleaned = df[col].str.replace(r"[\$,£€%]", "", regex=True).str.strip()
-        coerced = pd.to_numeric(cleaned, errors="coerce")
-        if coerced.notna().sum() / max(len(df), 1) >= 0.8:
-            df[col] = coerced
-    stats = df.describe().to_string()
-    return df, stats
+def ingest_csv(file):
+    df = robust_read_csv(file)
+    df.columns = df.columns.str.strip().str.lower().str.replace(r"[^\w]+", "_", regex=True)
+    profile = profile_columns(df)
+    df = apply_types(df, profile)
+    return df, profile
 
-def stream_response(prompt, spinner_text):
-    with st.spinner(spinner_text):
-        stream = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True
-        )
-        output = ""
-        with st.empty():
-            for chunk in stream:
-                output += chunk["message"]["content"]
-                st.write(output)
-    return output
+# -------------------------------
+# PANDAS GENERATION
+# -------------------------------
 
-def extract_sql(text):
-    for pattern in _SQL_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return match.group(1).strip()
+def build_schema(df):
+    lines = []
+    for col in df.columns:
+        samples = df[col].dropna().head(3).tolist()
+        lines.append(f"  {col} ({df[col].dtype}) — e.g. {', '.join(str(s) for s in samples)}")
+    return "\n".join(lines)
+
+def extract_pandas_expr(text):
+    # Code block first
+    match = re.search(r"```(?:python)?\s*([\s\S]+?)```", text, re.IGNORECASE)
+    if match:
+        code = match.group(1).strip()
+        lines = [l.strip() for l in code.splitlines() if l.strip() and not l.strip().startswith("#")]
+        return "\n".join(lines) if lines else None
+    # Inline backtick
+    match = re.search(r"`(df[^`\n]+)`", text)
+    if match:
+        return match.group(1).strip()
+    # Bare df expression
+    match = re.search(r"^(df[\s\S]+?)(?:\n\n|$)", text, re.MULTILINE)
+    if match:
+        lines = [l.strip() for l in match.group(1).splitlines() if l.strip() and not l.strip().startswith("#")]
+        return "\n".join(lines) if lines else None
     return None
 
-def validate_and_repair_sql(sql, col_map, varchar_cols):
-    try:
-        tree = sqlglot.parse_one(sql, dialect=DIALECT)
-    except sqlglot.errors.ParseError as e:
-        return None, f"Parse error: {e}"
+def generate_pandas_expr(question, df):
+    schema = build_schema(df)
+    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    date_hint = (
+        f"For time range questions, anchor to the data's own max date:\n"
+        f"  df[df['{date_cols[0]}'] >= df['{date_cols[0]}'].max() - pd.DateOffset(months=3)]"
+    ) if date_cols else ""
 
-    for col_node in tree.find_all(exp.Column):
-        name_lower = col_node.name.lower()
-        if name_lower in col_map:
-            actual = col_map[name_lower]
-            col_node.set("this", exp.Identifier(this=actual, quoted=" " in actual))
+    prompt = f"""Convert this question to a pandas expression using a DataFrame called `df`.
 
-    for agg_node in tree.find_all(exp.Avg, exp.Sum, exp.Min, exp.Max, exp.Stddev, exp.Variance):
-        for col_node in agg_node.find_all(exp.Column):
-            if col_node.name.lower() in varchar_cols:
-                col_node.replace(exp.TryCast(
-                    this=col_node.copy(),
-                    to=exp.DataType(this=exp.DataType.Type.DOUBLE)
-                ))
-
-    return tree.sql(dialect=DIALECT), None
-
-def try_sql(question, con, schema, col_map, varchar_cols):
-    sql_prompt = f"""You are a SQL expert. Convert the question into a DuckDB SQL query against a table called "df".
-
-Table schema:
+Schema:
 {schema}
 
 Rules:
-- Return ONLY the SQL query, nothing else
-- If the question cannot be expressed as SQL, respond with exactly: NO_SQL
-- Use single quotes for string values e.g. WHERE Department = 'Engineering'
-- Use double quotes only for column names that contain spaces e.g. "First Name"
+- If the question asks for data (filter, count, average, trend, top-N, group-by, time range) → return executable Python only, no explanation
+- If the question asks for analysis, explanation, opinion, or cannot be answered by querying data → respond with exactly: NO_PANDAS
+- Use only columns that exist in the schema above
+- `df` is the only variable available
+- For multi-step logic, use a single chained expression or multiple lines ending with the result
+{date_hint}
 
 Question: {question}"""
 
-    response = ollama.chat(model=MODEL, messages=[{"role": "user", "content": sql_prompt}])
-    raw = response["message"]["content"].strip()
-    debug = {"llm_raw": raw, "sql": None, "repaired_sql": None, "error": None, "path": None}
+    res = ollama.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+    raw = res["message"]["content"].strip()
+    if "NO_PANDAS" in raw.upper():
+        return None
+    return extract_pandas_expr(raw)
 
-    def fail(path, error=None):
-        debug["path"] = path
-        debug["error"] = error
-        return None, None, debug
+def run_pandas_expr(expr, df):
+    result = eval(expr, {"df": df, "pd": pd}, {})  # noqa: S307
+    if isinstance(result, pd.DataFrame):
+        return result.reset_index(drop=True)
+    if isinstance(result, pd.Series):
+        return result.reset_index()
+    return pd.DataFrame({"result": [result]})
 
-    if "NO_SQL" in raw.upper():
-        return fail("no_sql")
+def llm_repair_pandas(expr, error, df):
+    schema = build_schema(df)
+    prompt = f"""Fix this broken pandas expression.
 
-    sql = extract_sql(raw) or (raw if raw.upper().startswith("SELECT") else None)
-    debug["sql"] = sql
-    if not sql:
-        return fail("extract_failed")
+DataFrame `df` schema:
+{schema}
 
-    repaired_sql, parse_error = validate_and_repair_sql(sql, col_map, varchar_cols)
-    if parse_error:
-        return fail("parse_failed", parse_error)
+Broken expression:
+{expr}
 
-    debug["repaired_sql"] = repaired_sql
-    try:
-        result = con.execute(repaired_sql).df()
-        debug["path"] = "sql_success"
-        return repaired_sql, result, debug
-    except Exception as e:
-        return fail("exec_failed", str(e))
+Error:
+{error}
 
-def render_sql_result(result):
-    if result.shape == (1, 1):
-        st.metric(label=result.columns[0], value=result.iloc[0, 0])
-    elif result.shape[0] == 1:
-        for col in result.columns:
-            st.markdown(f"**{col}:** {result.iloc[0][col]}")
+Return ONLY the fixed expression, no explanation."""
+
+    res = ollama.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
+    return extract_pandas_expr(res["message"]["content"])
+
+# -------------------------------
+# AGENT LOOP
+# -------------------------------
+
+def run_agent(question, df, step_callback):
+    expr = generate_pandas_expr(question, df)
+
+    # LLM signalled this needs a text answer, not a data query
+    if expr is None:
+        return None, None
+
+    for i in range(3):
+        step = {"iteration": i, "expr": expr}
+
+        if not expr:
+            step["status"] = "error"
+            step["error"] = "No expression generated"
+            step_callback(step)
+            break
+
+        try:
+            result = run_pandas_expr(expr, df)
+            step["status"] = "success"
+            step_callback(step)
+            return expr, result
+
+        except Exception as e:
+            err = str(e)
+            step["status"] = "error"
+            step["error"] = err
+            step_callback(step)
+
+            if i < 2:
+                expr = llm_repair_pandas(expr, err, df)
+
+    return None, None
+
+# -------------------------------
+# LLM FALLBACK
+# -------------------------------
+
+def stream_llm_fallback(question, df):
+    keywords = [w for w in question.lower().split() if len(w) > 3]
+    str_cols = df.select_dtypes(include="object")
+    if keywords and not str_cols.empty:
+        pattern = "|".join(re.escape(k) for k in keywords)
+        mask = str_cols.apply(lambda col: col.str.contains(pattern, case=False, na=False)).any(axis=1)
+        subset = df[mask].head(20) if mask.any() else df.head(10)
     else:
-        for _, row in result.iterrows():
-            st.markdown("- " + " | ".join(f"**{col}:** {row[col]}" for col in result.columns))
+        subset = df.head(10)
 
-uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
+    context = f"Stats:\n{df.describe().to_string()}\n\nRelevant rows:\n{subset.to_string()}"
+    prompt = f"You are a data analyst.\n\nData:\n{context}\n\nAnswer clearly.\n\nQuestion: {question}"
 
-if uploaded_file:
-    df, cached_stats = load_data(uploaded_file)
+    stream = ollama.chat(model=MODEL, messages=[{"role": "user", "content": prompt}], stream=True)
+    output = ""
+    placeholder = st.empty()
+    for chunk in stream:
+        output += chunk["message"]["content"]
+        placeholder.markdown(output)
 
-    # Precompute schema metadata once per file
-    col_map = {c.lower(): c for c in df.columns}
-    varchar_cols = {c.lower() for c in df.select_dtypes(include="object").columns}
-    schema = "\n".join(f"  {col} ({dtype})" for col, dtype in zip(df.columns, df.dtypes))
-    compact_context = f"Columns and types:\n{df.dtypes.to_string()}\n\nSample data (3 rows):\n{df.head(3).to_string()}"
+# -------------------------------
+# UI
+# -------------------------------
 
-    # Cache duckdb connection and df registration per file
-    if st.session_state.get("df_id") != id(df):
-        con = duckdb.connect()
-        con.register("df", df)
-        st.session_state.db_conn = con
-        st.session_state.df_id = id(df)
-    con = st.session_state.db_conn
+st.title("📊 Self-Healing CSV Agent")
 
-    st.subheader("📋 Structure")
-    structure = pd.DataFrame({
-        "Column": df.columns,
-        "Type": df.dtypes.astype(str),
-        "Non-Null": df.notnull().sum(),
-        "Sample": [str(df[col].iloc[0]) if len(df) > 0 else "" for col in df.columns]
-    })
-    st.dataframe(structure, width="stretch")
+file = st.file_uploader("Upload CSV")
 
-    st.subheader("👀 Preview")
-    st.dataframe(df.sample(min(5, len(df))), width="stretch")
+if file:
+    df, profile = ingest_csv(file)
+    st.dataframe(df.head())
 
-    if st.button("Summarize CSV"):
-        prompt = f"""Analyze this CSV data and provide a brief summary:
+    q = st.text_input("Ask a question")
 
-Shape: {df.shape[0]} rows, {df.shape[1]} columns
-{compact_context}
+    if q:
+        st.markdown(f"### ❓ {q}")
+        step_container = st.container()
 
-Provide a 3-4 sentence summary of what this data contains and any notable patterns."""
-        stream_response(prompt, "Analyzing...")
+        def stream_step(step):
+            with step_container:
+                st.markdown(f"**Iteration {step['iteration']}**")
+                if step.get("expr"):
+                    st.code(step["expr"], language="python")
+                if step["status"] == "error":
+                    st.error(step["error"])
+                else:
+                    st.success("✅ Success")
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+        with st.spinner("🧠 Thinking..."):
+            expr, result = run_agent(q, df, stream_step)
 
-    st.subheader("💬 Ask a Question")
-
-    for entry in st.session_state.chat_history:
-        st.markdown(f"**Q:** {entry['question']}")
-        if entry.get("sql"):
-            st.code(entry["sql"], language="sql")
-        st.markdown(f"**A:** {entry['answer']}")
         st.divider()
 
-    question = st.text_input("Ask anything about the data:", key="question_input")
-
-    if question:
-        with st.spinner("Thinking..."):
-            sql, sql_result, debug = try_sql(question, con, schema, col_map, varchar_cols)
-
-        with st.expander("🔍 Debug", expanded=False):
-            st.write(f"**Path taken:** `{debug['path']}`")
-            st.write("**LLM raw output:**")
-            st.code(debug["llm_raw"])
-            if debug["sql"]:
-                st.write("**Extracted SQL:**")
-                st.code(debug["sql"], language="sql")
-            if debug["repaired_sql"] and debug["repaired_sql"] != debug["sql"]:
-                st.write("**Repaired SQL (sqlglot):**")
-                st.code(debug["repaired_sql"], language="sql")
-            if debug["error"]:
-                st.error(f"Error: {debug['error']}")
-
-        if sql is not None and sql_result is not None:
-            st.code(sql, language="sql")
-            render_sql_result(sql_result)
-            answer = sql_result.to_string(index=False)
+        if result is not None:
+            st.subheader("📊 Result")
+            st.dataframe(result)
         else:
-            context = compact_context
-            if any(word in question.lower() for word in STAT_KEYWORDS):
-                context += f"\n\nStatistics:\n{cached_stats}"
-            prompt = f"""You are a data analyst. Answer the question based on this CSV data.
-
-Shape: {df.shape[0]} rows, {df.shape[1]} columns
-{context}
-
-Question: {question}
-
-Answer concisely based on the data provided."""
-            answer = stream_response(prompt, "Thinking...")
-
-        history = st.session_state.chat_history
-        history.append({"question": question, "sql": sql, "answer": answer})
-        if len(history) > MAX_HISTORY:
-            st.session_state.chat_history = history[-MAX_HISTORY:]
+            with st.status("🤔 Thinking...", expanded=True) as status:
+                st.write("Pandas query couldn't answer this — analysing data directly...")
+                stream_llm_fallback(q, df)
+                status.update(label="💬 Answer ready", state="complete", expanded=True)
