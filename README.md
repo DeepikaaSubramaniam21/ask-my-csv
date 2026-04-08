@@ -53,6 +53,74 @@ To swap models, update the `MODEL` constant at the top of `app.py` and pull the 
 ollama pull gemma3:4b   # example
 ```
 
+## Use as a Claude Code Skill
+
+Prefer working in the terminal? The same functionality is available as a [Claude Code](https://claude.ai/code) skill — no browser, no Streamlit server, no Ollama required. Claude itself generates and runs the pandas code.
+
+### How it differs from the Streamlit app
+
+| | Streamlit app | Claude skill |
+|---|---|---|
+| Interface | Browser | Claude Code CLI |
+| LLM | Local (Ollama + phi3:mini) | Claude (Sonnet/Opus) |
+| Repair loop | 3 iterations | Not needed |
+| Dependencies | streamlit, ollama, chardet | pandas, chardet |
+
+### Installation
+
+**1. Create the skill directory**
+
+macOS/Linux:
+```bash
+mkdir -p ~/.claude/skills/ask-csv
+```
+
+Windows:
+```powershell
+mkdir "$env:USERPROFILE\.claude\skills\ask-csv"
+```
+
+**2. Copy the skill files**
+
+```bash
+# from the ask-my-csv repo root
+cp skills/ask-csv/SKILL.md ~/.claude/skills/ask-csv/
+cp skills/ask-csv/run_pandas.py ~/.claude/skills/ask-csv/
+```
+
+**3. Update the path in `SKILL.md`**
+
+Open `~/.claude/skills/ask-csv/SKILL.md` and replace the hardcoded path with your own:
+
+```
+# find and replace this:
+C:/Users/periy/.claude/skills/ask-csv/run_pandas.py
+
+# with your home directory path, e.g.:
+/Users/yourname/.claude/skills/ask-csv/run_pandas.py   # macOS/Linux
+C:/Users/yourname/.claude/skills/ask-csv/run_pandas.py # Windows
+```
+
+**4. Install the dependency**
+
+```bash
+pip install pandas chardet
+```
+
+**5. Restart Claude Code** to pick up the new skill.
+
+### Usage
+
+Inside Claude Code, type:
+
+```
+/ask-csv path/to/your.csv give me revenue by company
+/ask-csv path/to/your.csv top 5 customers last 3 months
+/ask-csv path/to/your.csv what are the risks for unity partners
+```
+
+Data questions (filter, aggregate, group-by, trends) run as pandas and return a result table. Analytical questions get a text answer using relevant rows as context.
+
 ## Requirements
 
 - Python 3.8+
